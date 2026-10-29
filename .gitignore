@@ -9,3 +9,4 @@ frontend/dist/
 *.sqlite3
 .env
 build/
+frontend/tsconfig.tsbuildinfo

@@ -5,11 +5,14 @@ Environment:  DATABASE_URL (default sqlite:///orbitlink.db)
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .commands import Priority
@@ -154,7 +157,7 @@ def create_app(db: Optional[Database] = None, seed_stations: bool = True) -> Fas
     def uplink(body: UplinkIn) -> dict[str, Any]:
         """Front-end processor hook: fetch the next TC frame to radiate during a contact."""
         frame = gs.next_uplink(utcnow(), body.remaining_s, body.frame_time_s)
-        return {"frame_hex": frame.hex() if frame else None, "queue_depth": len(gs.queue.pending)}
+        return {"frame_hex": frame.hex() if frame else None, "queue_depth": gs.queue.depth()}
 
     # ---------------------------------------------------------------- stations / passes / timeline
     @app.get("/api/stations")
@@ -197,6 +200,10 @@ def create_app(db: Optional[Database] = None, seed_stations: bool = True) -> Fas
     @app.get("/api/groundtrack")
     def groundtrack() -> dict[str, float]:
         return gs.ground_track(utcnow())
+
+    dist = Path(os.environ.get("ORBITLINK_FRONTEND", Path(__file__).resolve().parent.parent / "frontend" / "dist"))
+    if dist.is_dir():  # serve the built dashboard from the same process
+        app.mount("/", StaticFiles(directory=dist, html=True), name="frontend")
 
     return app
 
