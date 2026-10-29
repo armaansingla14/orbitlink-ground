@@ -1,0 +1,14 @@
+[project]
+name = "orbitlink"
+version = "0.3.0"
+description = "Ground-station software for a CubeSat mission: telemetry, commanding, pass planning"
+requires-python = ">=3.10"
+dependencies = ["fastapi>=0.110", "pydantic>=2", "numpy>=1.24", "sgp4>=2.22", "uvicorn>=0.29"]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+dev = ["pytest>=7", "httpx>=0.27"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
