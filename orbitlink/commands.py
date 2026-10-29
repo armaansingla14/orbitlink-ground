@@ -14,6 +14,7 @@ They differ only in ordering and failure handling:
 """
 from __future__ import annotations
 
+import bisect
 import itertools
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -39,7 +40,7 @@ class CmdState:
 TERMINAL = {CmdState.ACKED, CmdState.NACKED, CmdState.FAILED, CmdState.EXPIRED}
 
 
-@dataclass
+@dataclass(eq=False)  # identity semantics: queues hold and remove specific instances
 class Command:
     id: int
     name: str
@@ -82,9 +83,33 @@ class CommandQueue:
         self.ack_timeout_s = ack_timeout_s
         self.seq = seq or SeqAllocator()
         self.pending: list[Command] = []
+        self._has_deadlines = False
         self.in_flight: Optional[Command] = None
         self.done: list[Command] = []
         self.by_seq: dict[int, Command] = {}
+
+    # --- container hooks (overridden by ordered queues)
+    def _add(self, cmd: Command, front: bool = False) -> None:
+        if front:
+            self.pending.insert(0, cmd)
+        else:
+            self.pending.append(cmd)
+
+    def _remove(self, cmd: Command) -> None:
+        self.pending.remove(cmd)
+
+    def _contains(self, cmd: Command) -> bool:
+        return cmd.state == CmdState.QUEUED and any(c is cmd for c in self.pending)
+
+    def waiting(self) -> list[Command]:
+        return list(self.pending)
+
+    def depth(self) -> int:
+        return len(self.waiting()) + (1 if self.in_flight else 0)
+
+    def next_hold_release(self, now: float) -> Optional[float]:
+        times = [c.hold_until for c in self.waiting() if c.hold_until > now]
+        return min(times) if times else None
 
     # --- hooks for subclasses
     def _select(self, now: float, remaining_s: float, frame_time_s: float) -> Optional[Command]:
@@ -96,7 +121,9 @@ class CommandQueue:
     # --- public API
     def submit(self, cmd: Command) -> Command:
         cmd.state = CmdState.QUEUED
-        self.pending.append(cmd)
+        self._add(cmd)
+        if cmd.deadline is not None:
+            self._has_deadlines = True
         return cmd
 
     def next_to_send(self, now: float, remaining_s: float = float("inf"), frame_time_s: float = 0.0) -> Optional[Command]:
@@ -107,7 +134,7 @@ class CommandQueue:
         cmd = self._select(now, remaining_s, frame_time_s)
         if cmd is None:
             return None
-        self.pending.remove(cmd)
+        self._remove(cmd)
         if cmd.seq is None:
             cmd.seq = self.seq.next()
         self.by_seq[cmd.seq] = cmd
@@ -127,8 +154,8 @@ class CommandQueue:
         cmd.ack_status = status
         cmd.state = CmdState.ACKED if status == 0 else CmdState.NACKED
         cmd.history.append(("ack", now, status))
-        if cmd in self.pending:  # late ACK for an attempt we already gave up on
-            self.pending.remove(cmd)
+        if self._contains(cmd):  # late ACK for an attempt we already gave up on
+            self._remove(cmd)
         if self.in_flight is cmd:
             self.in_flight = None
         self.done.append(cmd)
@@ -155,13 +182,15 @@ class CommandQueue:
             self._on_timeout(cmd, now)
 
     def expire(self, now: float) -> None:
-        for cmd in [c for c in self.pending if c.deadline is not None and now > c.deadline]:
-            self.pending.remove(cmd)
+        if not self._has_deadlines:
+            return
+        for cmd in [c for c in self.waiting() if c.deadline is not None and now > c.deadline]:
+            self._remove(cmd)
             cmd.state = CmdState.EXPIRED
             self.done.append(cmd)
 
     def snapshot(self) -> list[Command]:
-        return ([self.in_flight] if self.in_flight else []) + list(self.pending)
+        return ([self.in_flight] if self.in_flight else []) + self.waiting()
 
 
 class FifoQueue(CommandQueue):
@@ -175,7 +204,7 @@ class FifoQueue(CommandQueue):
         cmd.state = CmdState.QUEUED
         cmd.seq = None
         cmd.resubmissions += 1
-        self.pending.append(cmd)
+        self._add(cmd)
 
 
 class PriorityRetryQueue(CommandQueue):
@@ -189,23 +218,54 @@ class PriorityRetryQueue(CommandQueue):
         self.hold_s = hold_s                # back-off after a failed burst
         self.max_attempts = max_attempts    # give up (FAILED) after this many attempts
         self._burst: dict[int, int] = {}
+        self.retry: list[Command] = []      # immediate retransmissions, served first
+        self._keys: list[float] = []        # sort keys parallel to self.pending
+
+    # Aging adds (now - submitted)/aging_s to every waiting command alike, so the
+    # ordering by effective priority equals ordering by this static key.
+    def _key(self, cmd: Command) -> float:
+        return float(cmd.priority) + cmd.submitted_at / self.aging_s
+
+    def _add(self, cmd: Command, front: bool = False) -> None:
+        if front:
+            self.retry.insert(0, cmd)
+            return
+        k = self._key(cmd)
+        i = bisect.bisect_right(self._keys, k)
+        self._keys.insert(i, k)
+        self.pending.insert(i, cmd)
+
+    def _remove(self, cmd: Command) -> None:
+        for i, c in enumerate(self.retry):
+            if c is cmd:
+                del self.retry[i]
+                return
+        k = self._key(cmd)
+        i = bisect.bisect_left(self._keys, k)
+        while self.pending[i] is not cmd:
+            i += 1
+        del self.pending[i]
+        del self._keys[i]
+
+    def _contains(self, cmd: Command) -> bool:
+        return cmd.state == CmdState.QUEUED and (any(c is cmd for c in self.retry) or any(c is cmd for c in self.pending))
+
+    def waiting(self) -> list[Command]:
+        return self.retry + self.pending
 
     def effective_priority(self, cmd: Command, now: float) -> float:
         # One priority class of promotion per `aging_s` waited (prevents starvation).
         return float(cmd.priority) - (now - cmd.submitted_at) / self.aging_s
 
     def _select(self, now, remaining_s, frame_time_s):
-        best = None
-        best_key = None
-        for c in self.pending:
-            if c.hold_until > now:
-                continue
-            if frame_time_s > 0 and c.frames * frame_time_s + self.ack_timeout_s > remaining_s:
-                continue  # would not complete before LOS
-            key = (self.effective_priority(c, now), c.submitted_at)
-            if best_key is None or key < best_key:
-                best, best_key = c, key
-        return best
+        for lst in (self.retry, self.pending):
+            for c in lst:
+                if c.hold_until > now:
+                    continue
+                if frame_time_s > 0 and c.frames * frame_time_s + self.ack_timeout_s > remaining_s:
+                    continue  # would not complete before LOS
+                return c
+        return None
 
     def _on_timeout(self, cmd, now):
         if cmd.attempts >= self.max_attempts:
@@ -217,12 +277,12 @@ class PriorityRetryQueue(CommandQueue):
         if burst <= self.max_retries:
             # Retransmit with the same sequence count, first in line.
             self._burst[cmd.id] = burst
-            self.pending.insert(0, cmd)
+            self._add(cmd, front=True)
         else:
             # Link looks bad: back off (usually until the next pass), keep the sequence count.
             self._burst[cmd.id] = 0
             cmd.hold_until = now + self.hold_s
-            self.pending.append(cmd)
+            self._add(cmd)
 
 
 def make_queue(policy: str, **kw) -> CommandQueue:
