@@ -82,7 +82,7 @@ def test_queue_survives_restart(tmp_path):
     gs1 = GroundSystem(db)
     gs1.submit_command("capture", {"frames": 3}, Priority.BULK, T0)
     gs2 = GroundSystem(Database(str(tmp_path / "ol.db")))
-    assert len(gs2.queue.pending) == 1 and gs2.queue.pending[0].args == b"\x03"
+    assert gs2.queue.depth() == 1 and gs2.queue.waiting()[0].args == b"\x03"
 
 
 def test_plan_passes_and_timeline(gs):

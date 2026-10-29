@@ -42,11 +42,11 @@ class Database:
     def _sql(self, sql: str) -> str:
         return sql.replace("?", "%s") if self.dialect == "postgres" else sql
 
-    def execute(self, sql: str, params: Iterable[Any] = ()) -> Optional[int]:
-        """Run a statement; returns the new row id for INSERTs."""
+    def execute(self, sql: str, params: Iterable[Any] = (), returning_id: bool = True) -> Optional[int]:
+        """Run a statement; returns the new row id for INSERTs into tables with an ``id`` column."""
         with self._lock:
             if self.dialect == "postgres":
-                if sql.lstrip().upper().startswith("INSERT") and "RETURNING" not in sql.upper():
+                if returning_id and sql.lstrip().upper().startswith("INSERT") and "RETURNING" not in sql.upper():
                     sql = sql.rstrip().rstrip(";") + " RETURNING id"
                     cur = self.conn.execute(self._sql(sql), tuple(params))
                     row = cur.fetchone()

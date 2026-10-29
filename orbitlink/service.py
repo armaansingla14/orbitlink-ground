@@ -81,7 +81,8 @@ class GroundSystem:
         self.db.execute(
             "INSERT INTO limits (param, red_low, yellow_low, yellow_high, red_high, persistence, enabled) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (lim.param, lim.red_low, lim.yellow_low, lim.yellow_high, lim.red_high, lim.persistence, lim.enabled))
+            (lim.param, lim.red_low, lim.yellow_low, lim.yellow_high, lim.red_high, lim.persistence, lim.enabled),
+            returning_id=False)
 
     # ------------------------------------------------------------ telemetry
     def ingest(self, raw: bytes, now: Optional[datetime] = None) -> dict[str, Any]:
@@ -154,8 +155,11 @@ class GroundSystem:
     # ------------------------------------------------------------ commands
     def _reload_queue(self) -> None:
         for r in self.db.query("SELECT * FROM commands WHERE state IN ('queued', 'sent') ORDER BY id"):
+            created = r["created_at"]  # ISO text on SQLite, datetime on PostgreSQL
+            if isinstance(created, str):
+                created = datetime.fromisoformat(created)
             cmd = Command(r["id"], r["name"], r["func"], bytes.fromhex(r["args_hex"]), Priority(r["priority"]),
-                          datetime.fromisoformat(r["created_at"]).timestamp())
+                          created.timestamp())
             cmd.seq = r["seq"]
             cmd.attempts = r["attempts"]
             self.queue.submit(cmd)
@@ -282,7 +286,7 @@ class GroundSystem:
             "latest_hk_at": self.latest_hk_at.isoformat() if self.latest_hk_at else None,
             "mode": self.latest_hk.get("mode_name"),
             "open_alerts": open_alerts,
-            "queue_depth": len(self.queue.pending) + (1 if self.queue.in_flight else 0),
+            "queue_depth": self.queue.depth(),
             "limit_states": self.limit_states(),
             "contact": self.current_contact(now),
             "elements": {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in asdict(self.elements).items()},
